@@ -1,0 +1,20 @@
+[
+  {
+    "id": 1,
+    "shop_name": "Test Shop",
+    "owner_name": "John Doe",
+    "email": "john.doe@testshop.com",
+    "phone": "+1234567890",
+    "shop_address": "123 Test Street, Test City, TC 12345",
+    "password": "$2a$10$NcuXHA3AQsun1lA9hgmXsuA7Ao9iBSGA//TkgibnWUIJEA1gE87bi",
+    "status": "DRAFT",
+    "created_at": "2025-09-22T05:01:04.218Z",
+    "updated_at": "2025-09-22T05:01:04.250Z",
+    "latitude": 40.7128,
+    "longitude": -74.006,
+    "location_updated_at": "2025-09-22T05:01:04.250Z",
+    "kyc_submitted_at": null,
+    "kyc_reviewed_at": null,
+    "review_notes": null
+  }
+]
