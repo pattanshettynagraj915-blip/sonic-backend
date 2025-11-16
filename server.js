@@ -9665,49 +9665,24 @@ app.use((error, req, res, next) => {
 });
 
 // Start server with automatic fallback if the port is in use
-// function startServer(portToUse, attempt = 0) {
-//   const parsedPort = Number(portToUse) || 5000;
-
-//   server.once('error', (err) => {
-//     if (err && err.code === 'EADDRINUSE') {
-//       const nextPort = parsedPort + 1;
-//       console.warn(`Port ${parsedPort} in use, retrying on ${nextPort}...`);
-//       // Retry on the next port
-//       startServer(nextPort, attempt + 1);
-//       return;
-//     }
-//     console.error('Server listen error:', err);
-//     process.exit(1);
-//   });
-
-//   server.listen(parsedPort, 'localhost', () => {
-//     console.log(`Server running on http://localhost:${parsedPort}`);
-//   });
-// }
-
-// startServer(PORT);
-
-// Start server with automatic fallback if the port is in use
 function startServer(portToUse, attempt = 0) {
   const parsedPort = Number(portToUse) || 5000;
 
-  server.once("error", (err) => {
-    if (err && err.code === "EADDRINUSE") {
+  server.once('error', (err) => {
+    if (err && err.code === 'EADDRINUSE') {
       const nextPort = parsedPort + 1;
       console.warn(`Port ${parsedPort} in use, retrying on ${nextPort}...`);
       // Retry on the next port
       startServer(nextPort, attempt + 1);
       return;
     }
-    console.error("Server listen error:", err);
+    console.error('Server listen error:', err);
     process.exit(1);
   });
 
-  // IMPORTANT FIX FOR RENDER
-  server.listen(parsedPort, "0.0.0.0", () => {
-    console.log(`Server running on port ${parsedPort}`);
+  server.listen(parsedPort, 'localhost', () => {
+    console.log(`Server running on http://localhost:${parsedPort}`);
   });
 }
 
-// Render will inject PORT automatically
-startServer(process.env.PORT || 5000);
+startServer(PORT);
