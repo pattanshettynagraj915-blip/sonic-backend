@@ -3,10 +3,17 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const axios = require('axios');
 const router = express.Router();
 
 // Use the shared database pool from utils/db.js
 const db = require('../utils/db');
+const {
+  uploadMulterFileToCloudinary,
+  deleteCloudinaryAsset,
+  extractPublicIdFromUrl,
+  detectResourceTypeFromUrl
+} = require('../utils/cloudinary');
 
 // Helper: check if a column exists on a given table in the current DB
 async function tableHasColumn(tableName, columnName) {
@@ -69,8 +76,9 @@ const upload = multer({
 });
 
 // Helper functions
-const calculateFileChecksum = (filePath) => {
-  const fileBuffer = fs.readFileSync(filePath);
+const calculateFileChecksum = (file) => {
+  if (!file) return null;
+  const fileBuffer = file.buffer || fs.readFileSync(file.path);
   return crypto.createHash('sha256').update(fileBuffer).digest('hex');
 };
 
@@ -100,6 +108,43 @@ const createNotification = async (vendorId, documentId, type, title, message, pr
     console.error('Error creating notification:', error);
   }
 };
+
+const isRemoteFilePath = (filePath) => /^https?:\/\//i.test(filePath || '');
+
+async function loadFileBuffer(filePath) {
+  if (!filePath) return null;
+  if (isRemoteFilePath(filePath)) {
+    const response = await axios.get(filePath, { responseType: 'arraybuffer' });
+    return Buffer.from(response.data);
+  }
+  const normalized = path.isAbsolute(filePath)
+    ? filePath
+    : path.join(process.cwd(), filePath.replace(/^\/+/, ''));
+  return fs.promises.readFile(normalized);
+}
+
+async function deleteStoredFile(filePath, mimeType = '') {
+  if (!filePath) return;
+  if (isRemoteFilePath(filePath)) {
+    const publicId = extractPublicIdFromUrl(filePath);
+    if (!publicId) return;
+    const resourceType = detectResourceTypeFromUrl(filePath) || (mimeType.includes('pdf') ? 'raw' : 'image');
+    try {
+      await deleteCloudinaryAsset(publicId, resourceType);
+    } catch (err) {
+      console.warn('Failed to delete Cloudinary asset:', err?.message || err);
+    }
+    return;
+  }
+  const normalized = path.isAbsolute(filePath)
+    ? filePath
+    : path.join(process.cwd(), filePath.replace(/^\/+/, ''));
+  try {
+    await fs.promises.unlink(normalized);
+  } catch (_) {
+    // ignore
+  }
+}
 
 // Routes
 
@@ -238,11 +283,19 @@ router.post('/upload/:vendorId', upload.fields([
       
       try {
         // Calculate file checksum
-        const checksum = calculateFileChecksum(file.path);
+        const checksum = calculateFileChecksum(file);
         
         // Set retention date (7 years from now)
         const retentionDate = new Date();
         retentionDate.setFullYear(retentionDate.getFullYear() + 7);
+
+        const resourceType = (file.mimetype || '').includes('pdf') ? 'raw' : 'image';
+        const uploadResult = await uploadMulterFileToCloudinary(file, {
+          folder: `kyc/${vendorId}/${docType}`,
+          resourceType
+        });
+        const storedPath = uploadResult.secure_url;
+        const storedFilename = uploadResult.public_id;
 
         // Check if document already exists for this vendor
         const [existingDoc] = await db.promise().query(`
@@ -255,9 +308,8 @@ router.post('/upload/:vendorId', upload.fields([
           // Update existing document
           documentId = existingDoc[0].id;
           
-          // Archive old file (optional - for audit purposes)
-          const oldDocQuery = await db.promise().query(`
-            SELECT file_path FROM kyc_documents WHERE id = ?
+          const [[oldDoc]] = await db.promise().query(`
+            SELECT file_path, mime_type FROM kyc_documents WHERE id = ?
           `, [documentId]);
           
           // Build a resilient UPDATE depending on available columns
@@ -268,7 +320,7 @@ router.post('/upload/:vendorId', upload.fields([
           const hasDocStatusUpdatedAt = await tableHasColumn('kyc_documents', 'doc_status_updated_at');
 
           let updateSql = `UPDATE kyc_documents SET filename = ?, original_name = ?, file_path = ?, file_size = ?, mime_type = ?, uploaded_at = NOW()`;
-          const params = [file.filename, file.originalname, file.path, file.size, file.mimetype];
+          const params = [storedFilename, file.originalname, storedPath, file.size, file.mimetype];
 
           if (hasChecksum) { updateSql += `, checksum_sha256 = ?`; params.push(checksum); }
           if (hasRetention) { updateSql += `, retention_until = ?`; params.push(retentionDate.toISOString().slice(0, 10)); }
@@ -280,6 +332,10 @@ router.post('/upload/:vendorId', upload.fields([
           params.push(documentId);
 
           await db.promise().query(updateSql, params);
+
+          if (oldDoc?.file_path) {
+            await deleteStoredFile(oldDoc.file_path, oldDoc.mime_type || file.mimetype || '');
+          }
 
           // Log replacement
           await logDocumentHistory(
@@ -296,7 +352,7 @@ router.post('/upload/:vendorId', upload.fields([
 
           const cols = ['vendor_id','document_type','filename','original_name','file_path','file_size','mime_type'];
           const placeholders = ['?','?','?','?','?','?','?'];
-          const values = [vendorId, docType, file.filename, file.originalname, file.path, file.size, file.mimetype];
+          const values = [vendorId, docType, storedFilename, file.originalname, storedPath, file.size, file.mimetype];
 
           if (hasChecksumI) { cols.push('checksum_sha256'); placeholders.push('?'); values.push(checksum); }
           if (hasRetentionI) { cols.push('retention_until'); placeholders.push('?'); values.push(retentionDate.toISOString().slice(0, 10)); }
@@ -326,7 +382,7 @@ router.post('/upload/:vendorId', upload.fields([
         uploadedDocuments.push({
           documentId,
           documentType: docType,
-          filename: file.filename,
+          filename: storedFilename,
           originalName: file.originalname,
           size: file.size,
           status: 'UPLOADED'
@@ -404,10 +460,7 @@ router.delete('/document/:documentId', async (req, res) => {
 
     const doc = document[0];
 
-    // Delete file from filesystem
-    if (fs.existsSync(doc.file_path)) {
-      fs.unlinkSync(doc.file_path);
-    }
+    await deleteStoredFile(doc.file_path, doc.mime_type || '');
 
     // Delete from database
     await db.promise().query(`DELETE FROM kyc_documents WHERE id = ?`, [documentId]);
@@ -450,14 +503,22 @@ router.get('/document/:documentId/download', async (req, res) => {
 
     const doc = document[0];
 
-    if (!fs.existsSync(doc.file_path)) {
+    if (isRemoteFilePath(doc.file_path)) {
+      return res.redirect(doc.file_path);
+    }
+
+    const absolute = path.isAbsolute(doc.file_path)
+      ? doc.file_path
+      : path.join(process.cwd(), doc.file_path.replace(/^\/+/, ''));
+
+    if (!fs.existsSync(absolute)) {
       return res.status(404).json({ success: false, error: 'File not found on server' });
     }
 
     res.setHeader('Content-Disposition', `attachment; filename="${doc.original_name}"`);
     res.setHeader('Content-Type', doc.mime_type);
     
-    const fileStream = fs.createReadStream(doc.file_path);
+    const fileStream = fs.createReadStream(absolute);
     fileStream.pipe(res);
 
   } catch (error) {

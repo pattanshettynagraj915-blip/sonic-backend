@@ -10,6 +10,8 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const axios = require('axios');
+const crypto = require('crypto');
 const fs = require('fs');
 const csv = require('csv-parser');
 const csvWriter = require('csv-writer');
@@ -17,6 +19,12 @@ const http = require('http');
 const socketIo = require('socket.io');
 const { sendPasswordResetEmail, sendPasswordResetSuccessEmail, sendVendorWelcomeEmail, sendEmail: sendEmailService } = require('./utils/emailService');
 const db = require("./utils/db");
+const {
+  uploadMulterFileToCloudinary,
+  deleteCloudinaryAsset,
+  extractPublicIdFromUrl,
+  detectResourceTypeFromUrl
+} = require('./utils/cloudinary');
 // Import notification services
 const NotificationService = require('./services/NotificationService');
 const SocketService = require('./services/SocketService');
@@ -74,6 +82,45 @@ function parseJsonSafely(possibleJson, fallback = null) {
     return JSON.parse(trimmed);
   } catch (_) {
     return fallback;
+  }
+}
+
+function isRemoteFilePath(filePath) {
+  return /^https?:\/\//i.test(filePath || '');
+}
+
+async function loadFileBuffer(filePath) {
+  if (!filePath) return null;
+  if (isRemoteFilePath(filePath)) {
+    const response = await axios.get(filePath, { responseType: 'arraybuffer' });
+    return Buffer.from(response.data);
+  }
+  const normalized = path.isAbsolute(filePath)
+    ? filePath
+    : path.join(process.cwd(), String(filePath).replace(/^\/+/, ''));
+  return fs.promises.readFile(normalized);
+}
+
+async function deleteStoredFile(filePath, mimeType = '') {
+  if (!filePath) return;
+  if (isRemoteFilePath(filePath)) {
+    const publicId = extractPublicIdFromUrl(filePath);
+    if (!publicId) return;
+    const resourceType = detectResourceTypeFromUrl(filePath) || (mimeType?.includes('pdf') ? 'raw' : 'image');
+    try {
+      await deleteCloudinaryAsset(publicId, resourceType);
+    } catch (err) {
+      console.warn('Cloudinary delete failed:', err?.message || err);
+    }
+    return;
+  }
+  const absolute = path.isAbsolute(filePath)
+    ? filePath
+    : path.join(process.cwd(), String(filePath).replace(/^\/+/, ''));
+  try {
+    await fs.promises.unlink(absolute);
+  } catch (_) {
+    // ignore
   }
 }
 
@@ -369,7 +416,18 @@ async function notifyKycStatusChange(vendorId, status, reviewNotes = null, softL
         const goLiveText = softLaunch.goLiveAt ? `Go-live: ${new Date(softLaunch.goLiveAt).toLocaleString()}. ` : '';
         const modeText = softLaunch.mode ? `Mode: ${softLaunch.mode}. ` : '';
         const notesText = softLaunch.notes ? `Notes: ${softLaunch.notes}` : '';
-        message = `Hello ${owner}, your vendor account has been approved. ${goLiveText}${modeText}${notesText}`.trim();
+        message = `Hello ${owner},Congratulations!Your vendor account is now approved on SonicKart.
+        1) Log in to your vendor dashboard
+        2) Upload KYC documents
+        3) Wait for verification
+        4) Start listing and selling products
+
+        Dashboard:
+
+       If you have any questions, reply to this email.
+
+       Welcome aboard!
+       Team SonicKart ${goLiveText}${modeText}${notesText}`.trim();
       } else {
         message = `Hello ${owner}, your vendor account has been approved and activated. You can accept orders immediately.`;
       }
@@ -2429,24 +2487,27 @@ app.post('/api/vendors/:id/kyc', upload.fields([
     
     // Save document information
     const documentData = {};
-    Object.keys(files).forEach(docType => {
+    for (const docType of Object.keys(files || {})) {
       const file = files[docType][0];
-      const crypto = require('crypto');
-      const fs = require('fs');
       const fileBuffer = fs.readFileSync(file.path);
       const checksum = crypto.createHash('sha256').update(fileBuffer).digest('hex');
       const sevenYears = new Date(); sevenYears.setFullYear(sevenYears.getFullYear() + 7);
+      const resourceType = (file.mimetype || '').includes('pdf') ? 'raw' : 'image';
+      const uploadResult = await uploadMulterFileToCloudinary(file, {
+        folder: `kyc/${id}/${docType}`,
+        resourceType
+      });
       documentData[docType] = {
-        filename: file.filename,
+        filename: uploadResult.public_id,
         originalName: file.originalname,
-        path: file.path,
+        path: uploadResult.secure_url,
         size: file.size,
         mimetype: file.mimetype,
         checksum,
         retentionUntil: sevenYears.toISOString().slice(0,10),
-        storageClass: 'standard'
+        storageClass: 'cloudinary'
       };
-    });
+    }
     
     // Insert or update KYC documents
     for (const [docType, docData] of Object.entries(documentData)) {
@@ -2527,7 +2588,7 @@ app.delete('/api/vendors/:vendorId/kyc-docs/:docId', async (req, res) => {
     }
 
     const [[doc]] = await db.promise().query(
-      'SELECT id, vendor_id, file_path FROM kyc_documents WHERE id = ? AND vendor_id = ? LIMIT 1',
+      'SELECT id, vendor_id, file_path, mime_type FROM kyc_documents WHERE id = ? AND vendor_id = ? LIMIT 1',
       [docId, vendorId]
     );
     if (!doc) {
@@ -2537,20 +2598,7 @@ app.delete('/api/vendors/:vendorId/kyc-docs/:docId', async (req, res) => {
     // Delete DB record
     await db.promise().query('DELETE FROM kyc_documents WHERE id = ? AND vendor_id = ? LIMIT 1', [docId, vendorId]);
 
-    // Best-effort filesystem cleanup for local storage paths
-    try {
-      const fs = require('fs');
-      const path = require('path');
-      const filePath = doc.file_path || '';
-      if (filePath && !/^https?:\/\//i.test(filePath)) {
-        const abs = path.isAbsolute(filePath) ? filePath : path.join(process.cwd(), filePath.replace(/^\/+/, ''));
-        if (fs.existsSync(abs)) {
-          fs.unlink(abs, () => {});
-        }
-      }
-    } catch (e) {
-      // ignore file delete errors
-    }
+    await deleteStoredFile(doc.file_path, doc.mime_type || '');
 
     return res.json({ message: 'Document deleted' });
   } catch (e) {
@@ -2619,14 +2667,33 @@ app.post('/api/vendor/profile/media', verifyToken, mediaUpload.fields([
     if (!logo && !banner) return res.status(400).json({ error: 'No files uploaded' });
     const updates = [];
     const params = [];
-    if (logo) { updates.push('logo_url = ?'); params.push('/' + logo.path.replace(/\\/g, '/')); }
-    if (banner) { updates.push('banner_url = ?'); params.push('/' + banner.path.replace(/\\/g, '/')); }
+    const responsePayload = {};
+    if (logo) {
+      const logoUpload = await uploadMulterFileToCloudinary(logo, {
+        folder: `vendors/${req.vendorId}/branding`,
+        resourceType: 'image',
+        useFilename: false
+      });
+      updates.push('logo_url = ?');
+      params.push(logoUpload.secure_url);
+      responsePayload.logo_url = logoUpload.secure_url;
+    }
+    if (banner) {
+      const bannerUpload = await uploadMulterFileToCloudinary(banner, {
+        folder: `vendors/${req.vendorId}/branding`,
+        resourceType: 'image',
+        useFilename: false
+      });
+      updates.push('banner_url = ?');
+      params.push(bannerUpload.secure_url);
+      responsePayload.banner_url = bannerUpload.secure_url;
+    }
     params.push(req.vendorId);
     await db.promise().query(
       `UPDATE vendors SET ${updates.join(', ')}, updated_at = NOW() WHERE id = ?`,
       params
     );
-    res.json({ message: 'Media uploaded', logo_url: logo ? '/' + logo.path.replace(/\\/g, '/') : undefined, banner_url: banner ? '/' + banner.path.replace(/\\/g, '/') : undefined });
+    res.json({ message: 'Media uploaded', ...responsePayload });
   } catch (e) {
     console.error('Vendor media upload error:', e);
     res.status(500).json({ error: 'Internal server error' });
@@ -2641,9 +2708,8 @@ app.delete('/api/vendor/profile/media', verifyToken, async (req, res) => {
     const column = type === 'logo' ? 'logo_url' : 'banner_url';
     const [[row]] = await db.promise().query(`SELECT ${column} FROM vendors WHERE id = ?`, [req.vendorId]);
     const url = row?.[column];
-    if (url && url.startsWith('/uploads/')) {
-      const p = url.startsWith('/') ? url.slice(1) : url;
-      try { fs.unlinkSync(p); } catch (_) {}
+    if (url) {
+      await deleteStoredFile(url, 'image');
     }
     await db.promise().query(`UPDATE vendors SET ${column} = NULL, updated_at = NOW() WHERE id = ?`, [req.vendorId]);
     res.json({ message: `${type} removed` });
@@ -2767,17 +2833,17 @@ app.post('/api/admin/kyc/:docId/ocr', verifyAdmin, async (req, res) => {
     const [[doc]] = await db.promise().query(`SELECT id, vendor_id, file_path, mime_type, document_type FROM kyc_documents WHERE id = ?`, [docId]);
     if (!doc) return res.status(404).json({ error: 'Document not found' });
 
-    const fs = require('fs');
-    const path = require('path');
     let extractedText = '';
     let boxes = [];
 
     try {
       if ((doc.mime_type || '').includes('pdf') || (doc.file_path || '').toLowerCase().endsWith('.pdf')) {
         const pdfParse = require('pdf-parse');
-        const dataBuffer = fs.readFileSync(path.resolve(doc.file_path));
-        const parsed = await pdfParse(dataBuffer);
-        extractedText = parsed.text || '';
+        const dataBuffer = await loadFileBuffer(doc.file_path);
+        if (dataBuffer) {
+          const parsed = await pdfParse(dataBuffer);
+          extractedText = parsed.text || '';
+        }
       }
     } catch (_) {}
 
@@ -3003,24 +3069,10 @@ app.delete('/api/admin/documents/:id/delete', verifyAdmin, async (req, res) => {
     const { id } = req.params;
     
     // Get document info before deletion
-    const [[doc]] = await db.promise().query('SELECT id, vendor_id, file_path, original_name, document_type FROM kyc_documents WHERE id = ? LIMIT 1', [id]);
+    const [[doc]] = await db.promise().query('SELECT id, vendor_id, file_path, original_name, document_type, mime_type FROM kyc_documents WHERE id = ? LIMIT 1', [id]);
     if (!doc) return res.status(404).json({ error: 'Document not found' });
 
-    // Delete file from filesystem
-    try {
-      const fs = require('fs');
-      const path = require('path');
-      const filePath = doc.file_path || '';
-      if (filePath && !/^https?:\/\//i.test(filePath)) {
-        const abs = path.isAbsolute(filePath) ? filePath : path.join(process.cwd(), filePath.replace(/^\/+/, ''));
-        if (fs.existsSync(abs)) {
-          fs.unlinkSync(abs);
-        }
-      }
-    } catch (e) {
-      console.error('File deletion error:', e);
-      // Continue with database deletion even if file deletion fails
-    }
+    await deleteStoredFile(doc.file_path, doc.mime_type || '');
 
     // Delete from database
     await db.promise().query('DELETE FROM kyc_documents WHERE id = ? LIMIT 1', [id]);
@@ -3084,9 +3136,6 @@ app.post('/api/admin/documents/:id/ocr', verifyAdmin, async (req, res) => {
     const [[doc]] = await db.promise().query('SELECT id, vendor_id, file_path, mime_type FROM kyc_documents WHERE id = ? LIMIT 1', [id]);
     if (!doc) return res.status(404).json({ error: 'Document not found' });
 
-    // Basic OCR pipeline (same as existing /api/admin/kyc/:docId/ocr)
-    const fs = require('fs');
-    const path = require('path');
     let ocrText = '';
     let ocrBoxes = [];
     
@@ -3094,16 +3143,26 @@ app.post('/api/admin/documents/:id/ocr', verifyAdmin, async (req, res) => {
     try {
       if ((doc.mime_type || '').includes('pdf') || (doc.file_path || '').toLowerCase().endsWith('.pdf')) {
         const pdfParse = require('pdf-parse');
-        const dataBuffer = fs.readFileSync(path.resolve(doc.file_path));
-        const parsed = await pdfParse(dataBuffer);
-        ocrText = parsed.text || '';
+        const dataBuffer = await loadFileBuffer(doc.file_path);
+        if (dataBuffer) {
+          const parsed = await pdfParse(dataBuffer);
+          ocrText = parsed.text || '';
+        }
       } else {
         // Use Tesseract.js for image files only
         const Tesseract = require('tesseract.js');
-        const resolved = path.resolve(String(doc.file_path));
-        const { data } = await Tesseract.recognize(resolved, 'eng');
-        ocrText = data?.text || '';
-        ocrBoxes = (data?.words || []).slice(0, 200).map(w => ({ x: w.bbox?.x0 || 0, y: w.bbox?.y0 || 0, w: (w.bbox?.x1 || 0) - (w.bbox?.x0 || 0), h: (w.bbox?.y1 || 0) - (w.bbox?.y0 || 0), label: w.text || '' }));
+        const buffer = await loadFileBuffer(doc.file_path);
+        if (buffer) {
+          const { data } = await Tesseract.recognize(buffer, 'eng');
+          ocrText = data?.text || '';
+          ocrBoxes = (data?.words || []).slice(0, 200).map(w => ({
+            x: w.bbox?.x0 || 0,
+            y: w.bbox?.y0 || 0,
+            w: (w.bbox?.x1 || 0) - (w.bbox?.x0 || 0),
+            h: (w.bbox?.y1 || 0) - (w.bbox?.y0 || 0),
+            label: w.text || ''
+          }));
+        }
       }
     } catch (_) {
       // Fallback: no OCR library available or file processing failed
@@ -3161,9 +3220,12 @@ app.get('/api/admin/documents/:id/download', verifyAdmin, async (req, res) => {
       [doc.vendor_id, id, (req.adminId || 'admin-api-key')]
     );
 
-    const path = require('path');
-    const fs = require('fs');
-    const absolute = path.resolve(doc.file_path);
+    if (isRemoteFilePath(doc.file_path)) {
+      return res.redirect(doc.file_path);
+    }
+    const absolute = path.isAbsolute(doc.file_path)
+      ? doc.file_path
+      : path.join(process.cwd(), doc.file_path.replace(/^\/+/, ''));
     if (!fs.existsSync(absolute)) return res.status(404).json({ error: 'File not found' });
     res.setHeader('Content-Type', doc.mime_type || 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(doc.original_name || 'document')}"`);
@@ -4169,14 +4231,17 @@ app.post('/api/upload/product-image', verifyToken, upload.single('image'), async
     if (!req.file) {
       return res.status(400).json({ error: 'Image file is required' });
     }
-    
-    // Generate public URL for the uploaded image
-    const imageUrl = `/uploads/${req.file.filename}`;
-    
+
+    const uploadResult = await uploadMulterFileToCloudinary(req.file, {
+      folder: `products/${req.vendorId || 'vendor'}`,
+      resourceType: 'image',
+      useFilename: false
+    });
+
     res.json({ 
       success: true, 
-      imageUrl: imageUrl,
-      filename: req.file.filename 
+      imageUrl: uploadResult.secure_url,
+      filename: uploadResult.public_id 
     });
   } catch (error) {
     console.error('Product image upload error:', error);
@@ -4190,14 +4255,17 @@ app.post('/api/admin/upload/product-image', verifyAdmin, upload.single('image'),
     if (!req.file) {
       return res.status(400).json({ error: 'Image file is required' });
     }
-    
-    // Generate public URL for the uploaded image
-    const imageUrl = `/uploads/${req.file.filename}`;
-    
+
+    const uploadResult = await uploadMulterFileToCloudinary(req.file, {
+      folder: `products/admin`,
+      resourceType: 'image',
+      useFilename: false
+    });
+
     res.json({ 
       success: true, 
-      imageUrl: imageUrl,
-      filename: req.file.filename 
+      imageUrl: uploadResult.secure_url,
+      filename: uploadResult.public_id 
     });
   } catch (error) {
     console.error('Admin product image upload error:', error);
@@ -8215,9 +8283,12 @@ app.get('/api/admin/kyc-documents/:docId/download', verifyAdmin, async (req, res
       [doc.vendor_id, docId, req.adminId || 'admin-api-key']
     );
 
-    const path = require('path');
-    const fs = require('fs');
-    const absolute = path.resolve(doc.file_path);
+    if (isRemoteFilePath(doc.file_path)) {
+      return res.redirect(doc.file_path);
+    }
+    const absolute = path.isAbsolute(doc.file_path)
+      ? doc.file_path
+      : path.join(process.cwd(), doc.file_path.replace(/^\/+/, ''));
     if (!fs.existsSync(absolute)) return res.status(404).json({ error: 'File not found' });
 
     res.setHeader('Content-Type', doc.mime_type || 'application/octet-stream');
@@ -9120,7 +9191,12 @@ app.post('/api/vendor/bank-details', verifyToken, upload.single('cancelled_chequ
     // Handle cancelled cheque upload
     let cancelledChequePath = null;
     if (req.file) {
-      cancelledChequePath = req.file.path;
+      const resourceType = (req.file.mimetype || '').includes('pdf') ? 'raw' : 'image';
+      const chequeUpload = await uploadMulterFileToCloudinary(req.file, {
+        folder: `vendors/${req.vendorId}/banking`,
+        resourceType
+      });
+      cancelledChequePath = chequeUpload.secure_url;
     }
 
     // Save or update bank details
@@ -9665,49 +9741,49 @@ app.use((error, req, res, next) => {
 });
 
 // Start server with automatic fallback if the port is in use
-// function startServer(portToUse, attempt = 0) {
-//   const parsedPort = Number(portToUse) || 5000;
-
-//   server.once('error', (err) => {
-//     if (err && err.code === 'EADDRINUSE') {
-//       const nextPort = parsedPort + 1;
-//       console.warn(`Port ${parsedPort} in use, retrying on ${nextPort}...`);
-//       // Retry on the next port
-//       startServer(nextPort, attempt + 1);
-//       return;
-//     }
-//     console.error('Server listen error:', err);
-//     process.exit(1);
-//   });
-
-//   server.listen(parsedPort, 'localhost', () => {
-//     console.log(`Server running on http://localhost:${parsedPort}`);
-//   });
-// }
-
-// startServer(PORT);
-
-// Start server with automatic fallback if the port is in use
 function startServer(portToUse, attempt = 0) {
   const parsedPort = Number(portToUse) || 5000;
 
-  server.once("error", (err) => {
-    if (err && err.code === "EADDRINUSE") {
+  server.once('error', (err) => {
+    if (err && err.code === 'EADDRINUSE') {
       const nextPort = parsedPort + 1;
       console.warn(`Port ${parsedPort} in use, retrying on ${nextPort}...`);
       // Retry on the next port
       startServer(nextPort, attempt + 1);
       return;
     }
-    console.error("Server listen error:", err);
+    console.error('Server listen error:', err);
     process.exit(1);
   });
 
-  // IMPORTANT FIX FOR RENDER
-  server.listen(parsedPort, "0.0.0.0", () => {
-    console.log(`Server running on port ${parsedPort}`);
+  server.listen(parsedPort, 'localhost', () => {
+    console.log(`Server running on http://localhost:${parsedPort}`);
   });
 }
 
-// Render will inject PORT automatically
-startServer(process.env.PORT || 5000);
+startServer(PORT);
+
+// Start server with automatic fallback if the port is in use
+// function startServer(portToUse, attempt = 0) {
+//   const parsedPort = Number(portToUse) || 5000;
+
+//   server.once("error", (err) => {
+//     if (err && err.code === "EADDRINUSE") {
+//       const nextPort = parsedPort + 1;
+//       console.warn(`Port ${parsedPort} in use, retrying on ${nextPort}...`);
+//       // Retry on the next port
+//       startServer(nextPort, attempt + 1);
+//       return;
+//     }
+//     console.error("Server listen error:", err);
+//     process.exit(1);
+//   });
+
+//   // IMPORTANT FIX FOR RENDER
+//   server.listen(parsedPort, "0.0.0.0", () => {
+//     console.log(`Server running on port ${parsedPort}`);
+//   });
+// }
+
+// // Render will inject PORT automatically
+// startServer(process.env.PORT || 5000);

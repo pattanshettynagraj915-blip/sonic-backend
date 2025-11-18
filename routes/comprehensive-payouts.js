@@ -7,6 +7,9 @@ const fs = require('fs').promises;
 const path = require('path');
 const multer = require('multer');
 const { sendPayoutNotification } = require('../utils/notificationService');
+const {
+  uploadMulterFileToCloudinary
+} = require('../utils/cloudinary');
 
 // Middleware for vendor authentication
 const authenticateVendor = (req, res, next) => {
@@ -270,10 +273,22 @@ router.post('/vendor/payment-methods', [
     let bankStatementPath = null;
 
     if (req.files?.cancelled_cheque?.[0]) {
-      cancelledChequePath = req.files.cancelled_cheque[0].path;
+      const chequeFile = req.files.cancelled_cheque[0];
+      const resourceType = (chequeFile.mimetype || '').includes('pdf') ? 'raw' : 'image';
+      const uploadResult = await uploadMulterFileToCloudinary(chequeFile, {
+        folder: `payouts/${req.vendorId}/payment-methods`,
+        resourceType
+      });
+      cancelledChequePath = uploadResult.secure_url;
     }
     if (req.files?.bank_statement?.[0]) {
-      bankStatementPath = req.files.bank_statement[0].path;
+      const statementFile = req.files.bank_statement[0];
+      const resourceType = (statementFile.mimetype || '').includes('pdf') ? 'raw' : 'image';
+      const uploadResult = await uploadMulterFileToCloudinary(statementFile, {
+        folder: `payouts/${req.vendorId}/payment-methods`,
+        resourceType
+      });
+      bankStatementPath = uploadResult.secure_url;
     }
 
     // Insert payment method
