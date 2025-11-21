@@ -145,6 +145,13 @@ try {
 } catch (e) {
   console.warn('Products routes failed to mount:', e?.message || e);
 }
+// Categories routes
+try {
+  const categoriesRoutes = require('./routes/categories');
+  app.use('/api/categories', categoriesRoutes);
+} catch (e) {
+  console.warn('Categories routes failed to mount:', e?.message || e);
+}
 // Vendor profile routes
 try {
   const vendorsRoutes = require('./routes/vendors');
